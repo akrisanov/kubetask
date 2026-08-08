@@ -15,9 +15,11 @@ and implementation details belong in design documents and ADRs.
 The terms **MUST**, **SHOULD**, and **MAY** indicate normative requirement
 strength as defined by RFC 2119 and RFC 8174:
 
-- **MUST**: an absolute requirement for v0.1
-- **SHOULD**: recommended for v0.1; omitting it requires a documented reason
-- **MAY**: optional for v0.1
+| Term       | Definition                                                     |
+| ---------- | -------------------------------------------------------------- |
+| **MUST**   | an absolute requirement for v0.1                               |
+| **SHOULD** | recommended for v0.1; omitting it requires a documented reason |
+| **MAY**    | optional for v0.1                                              |
 
 ## Primary use case
 
@@ -101,7 +103,7 @@ The following are outside the v0.1 scope:
 | ID     | Strength | Requirement                                                                                                                                                              |
 | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | FR-020 | MUST     | The service maintains an explicit task state machine with documented valid transitions and terminal states.                                                              |
-| FR-021 | MUST     | Terminal outcomes distinguish at least success, user-code failure, rejection, cancellation, timeout, expiration, and infrastructure failure.                             |
+| FR-021 | MUST     | Terminal task outcomes distinguish at least success, user-code failure, cancellation, timeout, expiration, and infrastructure failure. Submission rejection is a pre-task error, not a terminal task outcome. |
 | FR-022 | MUST     | A task record contains its current state, state timestamps, requested deadline, cancellation intent, associated execution resource, result location, and cleanup status. |
 | FR-023 | MUST     | A client can retrieve the current state and terminal result of a task by its internal identifier.                                                                        |
 | FR-024 | MUST     | State changes are atomic and safe under concurrent API and reconciliation activity.                                                                                      |
@@ -258,7 +260,7 @@ The following are outside the v0.1 scope:
 | ID      | Strength | Requirement                                                                                                                                                                                                         |
 | ------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | NFR-050 | MUST     | Logs are structured and include internal task ID, correlation ID, component, and state transition where applicable.                                                                                                 |
-| NFR-051 | MUST     | Metrics include submitted, accepted, rejected, pending, active, and terminal tasks; queue wait; allocation and execution duration; artifact bytes; reconciliation errors; cleanup failures; and downstream retries. |
+| NFR-051 | MUST     | Metrics include submitted requests, accepted tasks, rejected submissions, pending, active, and terminal tasks; queue wait; allocation and execution duration; artifact bytes; reconciliation errors; cleanup failures; and downstream retries. |
 | NFR-052 | MUST     | Metrics do not contain unbounded task IDs, external IDs, filenames, or other high-cardinality labels.                                                                                                               |
 | NFR-053 | MUST     | Every state transition and rejection can be correlated with an operational log record.                                                                                                                              |
 | NFR-054 | MUST     | Prometheus metrics are sufficient for v0.1; distributed tracing is not required.                                                                                                                                    |
