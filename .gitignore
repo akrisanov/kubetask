@@ -1,0 +1,78 @@
+# Legacy implementation
+.legacy/
+
+# Operating system metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+Desktop.ini
+
+# Editors and IDEs
+.idea/
+.vscode/
+*.code-workspace
+*.iml
+*.swp
+*.swo
+*~
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.local
+*.pem
+*.key
+
+# Logs and runtime state
+*.log
+*.pid
+*.pid.lock
+logs/
+tmp/
+temp/
+
+# Go build and test output
+bin/
+dist/
+coverage/
+*.coverprofile
+*.out
+*.test
+vendor/
+
+# Python environments and caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.pyright/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+*.egg-info/
+.eggs/
+build/
+
+# Packaging and generated artifacts
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+artifacts/
+
+# Kubernetes and local development tools
+.kube/
+.kind/
+.minikube/
+.tiltbuild/
+.task/
