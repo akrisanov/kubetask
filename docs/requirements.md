@@ -4,45 +4,32 @@ Last updated: 2026-08-08
 
 ## Purpose
 
-KubeTask is a Kubernetes-based service for executing isolated, short-lived
-tasks. It presents execution as a durable task lifecycle rather than as a
-container, Pod, or interactive sandbox session.
+KubeTask executes isolated, short-lived tasks on Kubernetes and exposes a
+durable task lifecycle rather than a workload or interactive session.
 
-This document defines the functional and non-functional requirements for
-v0.1. It describes required behavior and constraints. Architectural decisions
-and implementation details belong in design documents and ADRs.
-
-The terms **MUST**, **SHOULD**, and **MAY** indicate normative requirement
-strength as defined by RFC 2119 and RFC 8174:
-
-| Term       | Definition                                                     |
-| ---------- | -------------------------------------------------------------- |
-| **MUST**   | an absolute requirement for v0.1                               |
-| **SHOULD** | recommended for v0.1; omitting it requires a documented reason |
-| **MAY**    | optional for v0.1                                              |
+This document defines normative v0.1 behavior and constraints. Architecture
+and implementation belong in design documents and ADRs. Requirement strength
+follows RFC 2119 and RFC 8174: **MUST** is required, **SHOULD** may be omitted
+only with a documented reason, and **MAY** is optional.
 
 ## Primary use case
 
-An LLM orchestrator submits generated Python code, execution limits, and
-optional input files. KubeTask executes the code in an isolated, short-lived
-environment and returns its status, stdout, stderr, and generated artifacts to
-the orchestrator.
+An LLM orchestrator such as OpenWebUI or Archestra.ai submits generated Python
+and optional input files. KubeTask returns task state, stdout, stderr, and
+generated artifacts. MCP over Streamable HTTP is the primary agent-facing
+interface. HTTP exposes the same operations to backend services.
 
 ## Goals
 
 KubeTask v0.1 MUST:
 
-- accept a Python execution task through a stable application-facing API
-- execute the task in an isolated Kubernetes workload
-- manage the task asynchronously from submission through cleanup
-- apply admission, resource, time, and output limits
-- make task state and results durable across control-plane restarts
-- move task inputs and outputs without depending on Kubernetes `exec` after
-  workload completion
-- expose task results and artifact metadata in a structured form
-- recover incomplete work through task-level reconciliation
-- integrate with existing sandbox and runtime projects without duplicating their
-  responsibilities
+- expose a stable asynchronous API for isolated Python execution on Kubernetes
+- make task state and results durable from admission through cleanup
+- bound admission, resources, execution time, inputs, logs, and outputs
+- transfer inputs and results through object storage without post-completion
+  Kubernetes `exec`
+- reconcile incomplete work after restart while preserving the boundaries of
+  existing sandbox and runtime projects
 
 ## Non-goals for v0.1
 
@@ -50,10 +37,8 @@ The following are outside the v0.1 scope:
 
 - interactive or long-lived execution sessions
 - general-purpose Kubernetes batch scheduling
-- a generic multi-language runtime framework
-- JavaScript or other non-Python runtimes
-- Docker and Podman production backends
-- multiple permanent Kubernetes execution backends
+- multi-language execution, including JavaScript
+- Docker, Podman, or multiple permanent production execution backends
 - implementation of sandbox pooling or sandbox CRD reconciliation
 - implementation of container runtime isolation
 - package ecosystem support beyond the explicitly selected Python dependency
@@ -61,28 +46,28 @@ The following are outside the v0.1 scope:
 
 ## Actors
 
-| Actor            | Responsibility                                                                                                     |
-| ---------------- | ------------------------------------------------------------------------------------------------------------------ |
-| Client           | OpenWebUI, Archestra.ai, or another LLM backend or agent that submits, reads, or cancels tasks through MCP or HTTP |
-| Operator         | Configures limits, deploys the service, and observes its health                                                    |
-| Control plane    | Owns task admission, durable state, orchestration, reconciliation, and cleanup                                     |
-| Task runtime     | Prepares a workspace, executes submitted code, and publishes the result before exiting                             |
-| Sandbox provider | Owns the lifecycle of the isolated Kubernetes execution environment                                                |
-| Object store     | Stores task specifications, source, inputs, logs, result manifests, and artifacts                                  |
+| Actor            | Responsibility                                                           |
+| ---------------- | ------------------------------------------------------------------------ |
+| Client           | Submits, reads, or cancels tasks through MCP or HTTP                     |
+| Operator         | Configures, deploys, and observes the service                            |
+| Control plane    | Owns admission, task state, orchestration, reconciliation, and cleanup   |
+| Task runtime     | Prepares the workspace, executes code, and publishes results             |
+| Sandbox provider | Owns isolated execution-environment lifecycle                            |
+| Object store     | Stores task specifications, source, inputs, logs, manifests, and artifacts |
 
 ## Functional requirements
 
 ### Task submission and identity
 
-| ID     | Strength | Requirement                                                                                                                                                                                                               |
-| ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| FR-001 | MUST     | A client can submit a task containing inline UTF-8 Python source, an optional execution timeout, optional input references, and optional client metadata.                                                                 |
-| FR-002 | MUST     | Submission returns an internal, immutable task identifier after the request has been validated and durably accepted.                                                                                                      |
-| FR-003 | MUST     | Client-provided identifiers are treated as metadata and never used directly as filesystem paths or Kubernetes resource names.                                                                                             |
-| FR-004 | MUST     | The service supports an idempotency key for task submission. Repeating the same accepted request with the same key returns the same task. Reusing the key for a different request returns a deterministic conflict error. |
-| FR-005 | MUST     | Task submission is asynchronous and does not require the client connection to remain open for the duration of execution.                                                                                                  |
-| FR-006 | MUST     | The `run_task` convenience operation uses the asynchronous task model and waits up to 60 seconds. If the task is still active, it returns the task ID and current state.                                                  |
-| FR-007 | MUST     | A task can include bounded client metadata for correlation. Client metadata is non-authoritative and does not establish identity, ownership, or quota scope.                                                              |
+| ID     | Strength | Requirement                                                                                                                                                                                                                                                                             |
+| ------ | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| FR-001 | MUST     | A client can submit a task containing inline UTF-8 Python source, an optional execution timeout, optional input references, and optional client metadata. The timeout is the only client-selectable resource limit. CPU, memory, workspace, and process limits are operator-controlled. |
+| FR-002 | MUST     | Submission returns an internal, immutable task identifier after the request has been validated and durably accepted.                                                                                                                                                                    |
+| FR-003 | MUST     | Client-provided identifiers are treated as metadata and never used directly as filesystem paths or Kubernetes resource names.                                                                                                                                                           |
+| FR-004 | MUST     | The service supports an idempotency key for task submission. Repeating the same accepted request with the same key returns the same task. Reusing the key for a different request returns a deterministic conflict error.                                                               |
+| FR-005 | MUST     | Task submission is asynchronous and does not require the client connection to remain open for the duration of execution.                                                                                                                                                                |
+| FR-006 | MUST     | The `run_task` convenience operation uses the asynchronous task model and waits up to 60 seconds. If the task is still active, it returns the task ID and current state.                                                                                                                |
+| FR-007 | MUST     | Client metadata is bounded and stored with the task. Logs include its keys and only operator-allowlisted values. It is not used in metric labels or propagated directly to Kubernetes labels and never establishes identity, ownership, authorization, or quota scope.                  |
 
 ### Validation and admission
 
@@ -100,15 +85,15 @@ The following are outside the v0.1 scope:
 
 ### Task state and history
 
-| ID     | Strength | Requirement                                                                                                                                                              |
-| ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| FR-020 | MUST     | The service maintains an explicit task state machine with documented valid transitions and terminal states.                                                              |
+| ID     | Strength | Requirement                                                                                                                                                                                                   |
+| ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| FR-020 | MUST     | The service maintains an explicit task state machine with documented valid transitions and terminal states.                                                                                                   |
 | FR-021 | MUST     | Terminal task outcomes distinguish at least success, user-code failure, cancellation, timeout, expiration, and infrastructure failure. Submission rejection is a pre-task error, not a terminal task outcome. |
-| FR-022 | MUST     | A task record contains its current state, state timestamps, requested deadline, cancellation intent, associated execution resource, result location, and cleanup status. |
-| FR-023 | MUST     | A client can retrieve the current state and terminal result of a task by its internal identifier.                                                                        |
-| FR-024 | MUST     | State changes are atomic and safe under concurrent API and reconciliation activity.                                                                                      |
-| FR-025 | MUST     | Invalid or stale transition attempts cannot move a task backward or overwrite a terminal outcome.                                                                        |
-| FR-026 | SHOULD   | The service retains a compact transition history sufficient for operational diagnosis.                                                                                   |
+| FR-022 | MUST     | A task record contains its current state, state timestamps, requested deadline, cancellation intent, associated execution resource, result location, and cleanup status.                                      |
+| FR-023 | MUST     | A client can retrieve the current state and terminal result of a task by its internal identifier.                                                                                                             |
+| FR-024 | MUST     | State changes are atomic and safe under concurrent API and reconciliation activity.                                                                                                                           |
+| FR-025 | MUST     | Invalid or stale transition attempts cannot move a task backward or overwrite a terminal outcome.                                                                                                             |
+| FR-026 | SHOULD   | The service retains a compact transition history sufficient for operational diagnosis.                                                                                                                        |
 
 ### Task dispatch and execution
 
@@ -129,7 +114,7 @@ The following are outside the v0.1 scope:
 
 | ID     | Strength | Requirement                                                                                                                                                                                                                                                                    |
 | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| FR-040 | MUST     | An input reference contains a workspace-relative `path`, an object `key`, and optional `expected_size` and `etag` values for one operator-configured S3 bucket and prefix.                                                                                                     |
+| FR-040 | MUST     | An input reference contains a workspace-relative `path`, an object `key`, and optional `expected_size` and `etag` values for one operator-configured S3 bucket and prefix. Arbitrary URLs and inline base64 input files are not supported.                                     |
 | FR-041 | MUST     | Input paths are relative, normalized, and contained within the task workspace.                                                                                                                                                                                                 |
 | FR-042 | MUST     | Duplicate, absolute, traversing, or otherwise unsafe input paths are rejected deterministically.                                                                                                                                                                               |
 | FR-043 | MUST     | The runtime verifies configured input count and byte limits while materializing inputs, including when stored metadata is incorrect.                                                                                                                                           |
@@ -145,7 +130,7 @@ The following are outside the v0.1 scope:
 | ID     | Strength | Requirement                                                                                                                                                                                                                                |
 | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | FR-050 | MUST     | For every controlled outcome, including success, user-code failure, timeout, and cancellation, the runtime uploads a versioned result manifest before exit. Abrupt termination without a valid manifest becomes an infrastructure failure. |
-| FR-051 | MUST     | The runtime recursively collects regular files from `/workspace/outputs`. It does not follow symlinks or collect files outside that directory.                                                                                             |
+| FR-051 | MUST     | The runtime recursively collects regular files from `/workspace/outputs`. It does not follow symlinks or collect files outside that directory. The API does not accept output glob patterns.                                               |
 | FR-052 | MUST     | The runtime enforces per-file size, aggregate byte, and file-count limits while collecting outputs. Exceeding a limit fails the task with `output_limit_exceeded` and preserves bounded logs and uploaded artifacts as partial results.    |
 | FR-053 | MUST     | Artifact data is transferred directly to object storage; it is not carried through Kubernetes API responses or control-plane memory as a complete archive.                                                                                 |
 | FR-054 | MUST     | The control plane does not depend on executing commands in a terminated container to obtain results.                                                                                                                                       |
@@ -205,22 +190,22 @@ The following are outside the v0.1 scope:
 
 ### Security
 
-| ID      | Strength | Requirement                                                                                                                                                                                                          |
-| ------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| NFR-001 | MUST     | The threat model assumes submitted code and input files are malicious.                                                                                                                                               |
-| NFR-002 | MUST     | Task workloads comply with the Kubernetes Restricted Pod Security Standard, run as non-root, disallow privilege escalation, drop Linux capabilities, do not use `hostPath`, and do not run as privileged containers. |
-| NFR-003 | MUST     | Task workloads receive no Kubernetes service-account token unless a documented runtime integration requires one.                                                                                                     |
-| NFR-004 | MUST     | Each task receives only short-lived, task-scoped access to the object keys it must read or write. Long-lived infrastructure credentials are not exposed to user code.                                                |
-| NFR-005 | MUST     | Task egress is denied by default. Only DNS and operator-configured infrastructure endpoints required by the runtime are permitted. User code has no general internet or package-repository access.                   |
-| NFR-006 | MUST     | CPU, memory, ephemeral storage, process count, process duration, input, output, and log consumption are bounded.                                                                                                     |
-| NFR-007 | MUST     | Paths from requests, archives, manifests, and runtime output are normalized and checked for containment before filesystem use.                                                                                       |
-| NFR-008 | MUST     | Service and infrastructure credentials are redacted from API errors, logs, metrics, workload metadata, and persisted task status.                                                                                    |
-| NFR-009 | MUST     | Kubernetes RBAC and object-store permissions follow least privilege.                                                                                                                                                 |
-| NFR-010 | MUST     | Static source scanning, if provided, is treated only as defense in depth and not as the isolation boundary.                                                                                                          |
-| NFR-011 | SHOULD   | The runtime supports a configurable Kubernetes `RuntimeClass` for stronger isolation such as gVisor or Kata Containers.                                                                                              |
-| NFR-012 | MUST     | A v0.1 deployment restricts HTTP and MCP access to trusted internal callers through platform network controls. Application authentication and authorization are required before public or multi-user deployment.     |
-| NFR-013 | MUST     | Source, inputs, stdout, stderr, and artifact contents are not written to operational logs by default.                                                                                                                |
-| NFR-014 | MUST     | Each task workload has an enforced process-count limit.                                                                                                                                                              |
+| ID      | Strength | Requirement                                                                                                                                                                                                                                                                                                                                                            |
+| ------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| NFR-001 | MUST     | The threat model assumes submitted code and input files are malicious.                                                                                                                                                                                                                                                                                                 |
+| NFR-002 | MUST     | Task workloads comply with the Kubernetes Restricted Pod Security Standard, run as non-root, disallow privilege escalation, drop Linux capabilities, do not use `hostPath`, and do not run as privileged containers.                                                                                                                                                   |
+| NFR-003 | MUST     | Task workloads receive no Kubernetes service-account token unless a documented runtime integration requires one.                                                                                                                                                                                                                                                       |
+| NFR-004 | MUST     | Each task receives only short-lived, task-scoped access to the object keys it must read or write. Long-lived infrastructure credentials are not exposed to user code.                                                                                                                                                                                                  |
+| NFR-005 | MUST     | Task egress is denied by default. Only DNS and operator-configured infrastructure endpoints required by the runtime are permitted. User code has no general internet or package-repository access.                                                                                                                                                                     |
+| NFR-006 | MUST     | CPU, memory, ephemeral storage, process count, process duration, input, output, and log consumption are bounded.                                                                                                                                                                                                                                                       |
+| NFR-007 | MUST     | Paths from requests, archives, manifests, and runtime output are normalized and checked for containment before filesystem use.                                                                                                                                                                                                                                         |
+| NFR-008 | MUST     | Service and infrastructure credentials are redacted from API errors, logs, metrics, workload metadata, and persisted task status.                                                                                                                                                                                                                                      |
+| NFR-009 | MUST     | Kubernetes RBAC and object-store permissions follow least privilege.                                                                                                                                                                                                                                                                                                   |
+| NFR-010 | MUST     | Static source scanning, if provided, is treated only as defense in depth and not as the isolation boundary.                                                                                                                                                                                                                                                            |
+| NFR-011 | SHOULD   | The runtime supports a configurable Kubernetes `RuntimeClass` for stronger isolation such as gVisor or Kata Containers.                                                                                                                                                                                                                                                |
+| NFR-012 | MUST     | v0.1 is single-tenant and restricts HTTP and MCP access to trusted internal callers through platform network controls. Application authentication, authorization, and task ownership are not required for this deployment. Public or multi-user deployment requires them and uses service-derived tenant and principal identifiers kept separate from client metadata. |
+| NFR-013 | MUST     | Source, inputs, stdout, stderr, and artifact contents are not written to operational logs by default.                                                                                                                                                                                                                                                                  |
+| NFR-014 | MUST     | Each task workload has an enforced process-count limit.                                                                                                                                                                                                                                                                                                                |
 
 ### Reliability and consistency
 
@@ -257,14 +242,14 @@ The following are outside the v0.1 scope:
 
 ### Observability and operability
 
-| ID      | Strength | Requirement                                                                                                                                                                                                         |
-| ------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| NFR-050 | MUST     | Logs are structured and include internal task ID, correlation ID, component, and state transition where applicable.                                                                                                 |
+| ID      | Strength | Requirement                                                                                                                                                                                                                                    |
+| ------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| NFR-050 | MUST     | Logs are structured and include internal task ID, correlation ID, component, and state transition where applicable.                                                                                                                            |
 | NFR-051 | MUST     | Metrics include submitted requests, accepted tasks, rejected submissions, pending, active, and terminal tasks; queue wait; allocation and execution duration; artifact bytes; reconciliation errors; cleanup failures; and downstream retries. |
-| NFR-052 | MUST     | Metrics do not contain unbounded task IDs, external IDs, filenames, or other high-cardinality labels.                                                                                                               |
-| NFR-053 | MUST     | Every state transition and rejection can be correlated with an operational log record.                                                                                                                              |
-| NFR-054 | MUST     | Prometheus metrics are sufficient for v0.1; distributed tracing is not required.                                                                                                                                    |
-| NFR-055 | SHOULD   | Operator documentation covers installation, configuration, dependency failure, stuck-task diagnosis, cancellation, cleanup failure, and recovery.                                                                   |
+| NFR-052 | MUST     | Metrics do not contain unbounded task IDs, external IDs, filenames, or other high-cardinality labels.                                                                                                                                          |
+| NFR-053 | MUST     | Every state transition and rejection can be correlated with an operational log record.                                                                                                                                                         |
+| NFR-054 | MUST     | Prometheus metrics are sufficient for v0.1; distributed tracing is not required.                                                                                                                                                               |
+| NFR-055 | SHOULD   | Operator documentation covers installation, configuration, dependency failure, stuck-task diagnosis, cancellation, cleanup failure, and recovery.                                                                                              |
 
 ### Maintainability and compatibility
 
@@ -296,94 +281,53 @@ Changing a project constraint requires an ADR.
 
 ## Initial quantitative limits and service objectives
 
-These values provide an initial reference profile. Operators may configure
-stricter limits. Higher limits require validation against cluster and storage
-capacity. The values will be reviewed after capacity testing and production
-experience.
+These values form the initial reference profile. Operators may use stricter
+limits. Higher limits require capacity validation. The profile will be reviewed
+after capacity testing and production experience.
 
-| Target                                     | Initial v0.1 value                                                  | Rationale                                                                        |
-| ------------------------------------------ | ------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
-| Maximum source and task specification size | 1 MiB combined                                                      | Generous for generated Python code while bounding admission and storage          |
-| Maximum client metadata                    | 16 entries; 64 bytes per key; 256 bytes per value; 4 KiB total      | Supports correlation without creating an unbounded metadata surface              |
-| Maximum input files                        | 20 files                                                            | Supports common document and data-analysis tasks                                 |
-| Maximum input size                         | 50 MiB per file; 100 MiB aggregate                                  | Supports moderate datasets without making KubeTask a large-data transfer service |
-| Maximum output files                       | 100 files                                                           | Supports reports, plots, and related files while limiting file-count abuse       |
-| Maximum artifact size                      | 50 MiB per file; 250 MiB aggregate                                  | Supports common generated documents and workbooks                                |
-| Maximum stdout                             | 1 MiB                                                               | Prevents unbounded output; truncation must be explicit                           |
-| Maximum stderr                             | 1 MiB                                                               | Prevents unbounded output; truncation must be explicit                           |
-| Maximum inline stdout and stderr preview   | 64 KiB per stream                                                   | Returns common results directly without creating an unbounded API response       |
-| Maximum processes per task                 | 256                                                                 | Bounds fork and process exhaustion while supporting common Python libraries      |
-| CPU                                        | 100m minimum; 1 CPU default; 2 CPU maximum                          | Provides a practical baseline while limiting initial cluster demand              |
-| Memory                                     | 256 MiB minimum; 512 MiB default; 4 GiB maximum                     | Supports common Python tasks and permits larger bounded workloads                |
-| Maximum ephemeral workspace                | 1 GiB                                                               | Provides space for inputs, outputs, and temporary files                          |
-| Task execution time                        | 1 second minimum; 60 seconds default; 300 seconds maximum           | Supports short-lived tasks while bounding resource use                           |
-| Maximum pending time                       | 5 minutes                                                           | Prevents accepted tasks from remaining queued indefinitely                       |
-| Maximum sandbox allocation time            | 2 minutes                                                           | Bounds infrastructure allocation delays                                          |
-| `run_task` wait time                       | 60 seconds                                                          | Returns fast results directly without coupling the tool call to long execution   |
-| Default active task limit                  | 20 tasks per deployment                                             | Provides a conservative initial admission limit, not a scalability ceiling       |
-| Default pending task limit                 | 100 tasks per deployment                                            | Absorbs short bursts without creating an unbounded queue                         |
-| Submit API latency                         | p95 at most 500 ms; p99 at most 1 second                            | Covers validation, persistence, and durable acceptance, not task execution       |
-| Get and cancel API latency                 | p95 at most 250 ms; p99 at most 500 ms                              | These operations use authoritative task state directly                           |
-| Reconciliation recovery after restart      | All incomplete tasks reconsidered within 60 seconds after readiness | Provides a measurable recovery objective                                         |
-| Task metadata retention                    | 30 days after terminal state                                        | Supports operational diagnosis without indefinite retention                      |
-| Log and artifact retention                 | 7 days after terminal state                                         | Provides time for result retrieval while limiting storage growth                 |
-| Presigned GET URL lifetime                 | 15 minutes                                                          | Limits bearer-link exposure while allowing immediate result retrieval            |
-| Control-plane availability                 | 99.5% per calendar month                                            | Provides an initial objective before production evidence is available            |
+| Target                                     | Initial v0.1 value                                                  |
+| ------------------------------------------ | ------------------------------------------------------------------- |
+| Maximum source and task specification size | 1 MiB combined                                                      |
+| Maximum client metadata                    | 16 entries; 64 bytes per key; 256 bytes per value; 4 KiB total      |
+| Maximum input files                        | 20 files                                                            |
+| Maximum input size                         | 50 MiB per file; 100 MiB aggregate                                  |
+| Maximum output files                       | 100 files                                                           |
+| Maximum artifact size                      | 50 MiB per file; 250 MiB aggregate                                  |
+| Maximum stdout                             | 1 MiB                                                               |
+| Maximum stderr                             | 1 MiB                                                               |
+| Maximum inline stdout and stderr preview   | 64 KiB per stream                                                   |
+| Maximum processes per task                 | 256                                                                 |
+| CPU                                        | 100m minimum; 1 CPU default; 2 CPU maximum                          |
+| Memory                                     | 256 MiB minimum; 512 MiB default; 4 GiB maximum                     |
+| Maximum ephemeral workspace                | 1 GiB                                                               |
+| Task execution time                        | 1 second minimum; 60 seconds default; 300 seconds maximum           |
+| Maximum pending time                       | 5 minutes                                                           |
+| Maximum sandbox allocation time            | 2 minutes                                                           |
+| `run_task` wait time                       | 60 seconds                                                          |
+| Default active task limit                  | 20 tasks per deployment                                             |
+| Default pending task limit                 | 100 tasks per deployment                                            |
+| Submit API latency                         | p95 at most 500 ms; p99 at most 1 second                            |
+| Get and cancel API latency                 | p95 at most 250 ms; p99 at most 500 ms                              |
+| Reconciliation recovery after restart      | All incomplete tasks reconsidered within 60 seconds after readiness |
+| Task metadata retention                    | 30 days after terminal state                                        |
+| Log and artifact retention                 | 7 days after terminal state                                         |
+| Presigned GET URL lifetime                 | 15 minutes                                                          |
+| Control-plane availability                 | 99.5% per calendar month                                            |
 
 The following definitions apply:
 
-- `MiB` and `GiB` are binary units.
-- Input and output limits apply to uncompressed bytes.
-- Truncated stdout or stderr includes an explicit truncation indicator. The
-  preview preserves content from the beginning and end of the stream.
-- A task result reports whether each stream was truncated, the captured and
-  total byte counts, and a storage reference for the bounded captured stream.
-- The runtime continues to drain stdout and stderr after reaching capture limits
-  so user code cannot block on a full pipe.
-- Task execution time starts when the runtime begins workspace preparation. It
-  includes input retrieval, user-code execution, artifact collection, and result
-  publication. It excludes sandbox allocation.
-- API latency is measured at the service boundary and excludes task dispatch
-  and execution.
-- Active and pending task limits are default admission settings, not tested
-  platform capacity.
-- Retention starts when a task enters a terminal state.
-- Control-plane availability is the percentage of valid API requests that do
-  not fail because of KubeTask or a required dependency.
-
-## Product and policy decisions
-
-| Area                 | v0.1 decision                                                                                                                                            |
-| -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Initial clients      | OpenWebUI, Archestra.ai, and other backend services or agents that orchestrate LLM requests                                                              |
-| Interfaces           | MCP over Streamable HTTP is the primary agent-facing interface; HTTP exposes the same task operations to backend services                                |
-| Deployment trust     | The service is deployed on a trusted internal network, and platform network controls restrict access                                                     |
-| Authentication       | Application-level authentication is not required for v0.1                                                                                                |
-| Authorization        | Task ownership enforcement is not required for v0.1                                                                                                      |
-| Tenancy              | The service is single-tenant                                                                                                                             |
-| Future tenancy       | Bounded client metadata supports correlation but is never used as verified identity, ownership, or quota scope                                           |
-| Execution backend    | Agent Sandbox is the only production execution backend                                                                                                   |
-| Source submission    | The task request contains inline UTF-8 Python source                                                                                                     |
-| Source delivery      | The control plane persists source and gives the runtime a task-scoped storage reference                                                                  |
-| Resource controls    | Clients may request only an execution timeout within configured bounds; CPU, memory, workspace, and process limits are operator-controlled               |
-| Input files          | Input references contain a relative path and object key in one configured S3 bucket and prefix; arbitrary URLs and inline base64 files are not supported |
-| Python dependencies  | The official runtime image includes NumPy, pandas, SciPy, Matplotlib, Seaborn, Pillow, openpyxl, XlsxWriter, python-docx, pypdf, and ReportLab           |
-| Dynamic installation | Runtime package installation is not supported                                                                                                            |
-| Network access       | User code has no general internet or package-repository access                                                                                           |
-| Execution attempts   | Allocation and preparation may retry; user code runs at most once after the task enters `Running`                                                        |
-| Output collection    | The runtime recursively collects regular files from `/workspace/outputs`; the API does not accept output glob patterns                                   |
-| Output limit failure | Exceeding an output limit fails the task and preserves bounded logs and uploaded artifacts as partial results                                            |
-| Logs                 | Results contain bounded stdout and stderr previews and storage references for bounded captured streams                                                   |
-| Artifact access      | Clients obtain on-demand presigned GET URLs that expire after 15 minutes                                                                                 |
-
-Client metadata has the following rules:
-
-- key count and key and value sizes are bounded
-- metadata is stored with the task; operational logs include keys and only
-  operator-allowlisted values
-- metadata is not used as a Prometheus label
-- metadata is not propagated directly to Kubernetes labels
-- metadata never establishes identity, ownership, authorization, or quota scope
-
-If multi-tenancy is added later, authenticated tenant and principal identifiers
-must be derived by the service and kept separate from client metadata.
+- `MiB` and `GiB` are binary units. Input and output limits count uncompressed
+  bytes
+- Stream truncation is explicit. Previews preserve the beginning and end, and
+  results include captured and total bytes plus the stored-stream reference
+- The runtime continues draining stdout and stderr after capture limits so user
+  code cannot block on a full pipe
+- Execution time starts with workspace preparation, includes input retrieval,
+  code execution, artifact collection, and result publication, and excludes
+  sandbox allocation
+- API latency is measured at the service boundary and excludes dispatch and
+  execution
+- Active and pending limits are admission defaults, not tested platform capacity
+- Retention starts at terminal state
+- Availability is the percentage of valid API requests that do not fail because
+  of KubeTask or a required dependency
