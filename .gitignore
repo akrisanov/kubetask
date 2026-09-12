@@ -16,6 +16,7 @@ Desktop.ini
 *.swp
 *.swo
 *~
+skills
 
 # Local configuration and secrets
 .env
