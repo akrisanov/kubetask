@@ -165,7 +165,9 @@ func RecordValidation(
 	if at.Before(t.Receipt.AcceptedAt) {
 		return Decision{}, ErrCausalOrder
 	}
-	if !knownValidationResult(result) {
+	switch result {
+	case ValidationValid, ValidationInvalid, ValidationUnavailable:
+	default:
 		return Decision{}, ErrInvalidTransition
 	}
 	if finalRead && at.Before(t.Validation.RetryDeadline) {
@@ -332,9 +334,6 @@ func recordCapacityFact(
 }
 
 func settle(t Task, at time.Time) (Decision, bool) {
-	if t.Outcome != nil {
-		return Decision{Task: clone(t)}, false
-	}
 	if t.State == Running && t.Receipt != nil {
 		return Decision{Task: clone(t)}, false
 	}
@@ -431,13 +430,4 @@ func sameReceipt(left, right CompletionReceipt) bool {
 func matchesAuthorization(a *Authorization, r CompletionReceipt) bool {
 	return a.ExecutionIdentity == r.ExecutionIdentity &&
 		a.RuntimeBootID == r.RuntimeBootID
-}
-
-func knownValidationResult(result ValidationResult) bool {
-	switch result {
-	case ValidationValid, ValidationInvalid, ValidationUnavailable:
-		return true
-	default:
-		return false
-	}
 }
