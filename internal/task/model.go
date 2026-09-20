@@ -15,20 +15,6 @@ import (
 // ValidationWindow is the fixed period allowed for receipt validation retries.
 const ValidationWindow = 60 * time.Second
 
-// Lifecycle errors identify rejected domain decisions.
-var (
-	ErrStale             = errors.New("task state or version is stale")
-	ErrInvalidTransition = errors.New("invalid task transition")
-	ErrTerminal          = errors.New("task has an immutable terminal outcome")
-	ErrAuthorizationUsed = errors.New("execution authorization was already used")
-	ErrReceiptConflict   = errors.New("completion receipt conflicts with the accepted receipt")
-	ErrReceiptIneligible = errors.New("completion receipt is not eligible")
-	ErrFinalReadRequired = errors.New("final validation read is required")
-	ErrCapacityHeld      = errors.New("capacity release conditions are not satisfied")
-	ErrInvalidEventTime  = errors.New("event time is invalid")
-	ErrCausalOrder       = errors.New("event time violates lifecycle causal order")
-)
-
 // State is the task's authoritative lifecycle state.
 type State string
 
@@ -79,19 +65,6 @@ const (
 	ExecutionFailure      FailureKind = "execution_failure"
 	InfrastructureFailure FailureKind = "infrastructure_failure"
 )
-
-// Expected is the state and version a decision must replace atomically.
-type Expected struct {
-	State   State
-	Version uint64
-}
-
-// Timing contains the persisted deadline policy for one accepted task.
-type Timing struct {
-	PendingDeadline  time.Time
-	AllocationWindow time.Duration
-	ExecutionWindow  time.Duration
-}
 
 // CancellationIntent records the first durable cancellation request.
 type CancellationIntent struct {
@@ -185,6 +158,12 @@ type Task struct {
 	History       []HistoryEntry
 }
 
+// Expected is the state and version a decision must replace atomically.
+type Expected struct {
+	State   State
+	Version uint64
+}
+
 // Decision is a candidate replacement record. Persist Task atomically using the
 // expected state and version before asking a runtime to act on it.
 type Decision struct {
@@ -192,6 +171,13 @@ type Decision struct {
 	Changed                bool
 	AuthorizationRecorded  bool
 	ReceiptAlreadyAccepted bool
+}
+
+// Timing contains the persisted deadline policy for one accepted task.
+type Timing struct {
+	PendingDeadline  time.Time
+	AllocationWindow time.Duration
+	ExecutionWindow  time.Duration
 }
 
 // New creates the initial Pending record for a durably accepted task.

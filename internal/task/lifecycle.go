@@ -1,13 +1,23 @@
 package task
 
-import "time"
+import (
+	"errors"
+	"time"
+)
 
-type phaseRule struct {
-	deadline      time.Time
-	terminalState State
-	outcome       OutcomeKind
-	code          string
-}
+// Lifecycle errors identify rejected domain decisions.
+var (
+	ErrStale             = errors.New("task state or version is stale")
+	ErrInvalidTransition = errors.New("invalid task transition")
+	ErrTerminal          = errors.New("task has an immutable terminal outcome")
+	ErrAuthorizationUsed = errors.New("execution authorization was already used")
+	ErrReceiptConflict   = errors.New("completion receipt conflicts with the accepted receipt")
+	ErrReceiptIneligible = errors.New("completion receipt is not eligible")
+	ErrFinalReadRequired = errors.New("final validation read is required")
+	ErrCapacityHeld      = errors.New("capacity release conditions are not satisfied")
+	ErrInvalidEventTime  = errors.New("event time is invalid")
+	ErrCausalOrder       = errors.New("event time violates lifecycle causal order")
+)
 
 // RequestCancellation records the first cancellation intent without stopping a runtime.
 func RequestCancellation(t Task, expected Expected, at time.Time) (Decision, error) {
@@ -354,6 +364,13 @@ func settle(t Task, at time.Time) (Decision, bool) {
 		return Decision{Task: next, Changed: true}, true
 	}
 	return Decision{}, false
+}
+
+type phaseRule struct {
+	deadline      time.Time
+	terminalState State
+	outcome       OutcomeKind
+	code          string
 }
 
 func phaseRuleFor(t Task) phaseRule {
