@@ -1,6 +1,6 @@
 # Requirements
 
-Last updated: 2026-09-12
+Last updated: 2026-09-20
 
 ## Purpose
 
@@ -39,7 +39,26 @@ The following are outside the v0.1 scope:
 - Docker, Podman, or multiple permanent production execution backends
 - implementation of sandbox pooling or sandbox CRD reconciliation
 - implementation of container runtime isolation
+- hardened isolation or a security guarantee for hostile submitted code
 - package ecosystem support beyond the explicitly selected Python dependency policy
+
+### v0.1 trust and local development scope
+
+v0.1 targets controlled deployments within an explicitly documented trust model.
+It does not claim safe execution of hostile code. Trusted access to the API does
+not make LLM-generated code trustworthy. A deployment that needs adversarial
+code containment requires a deliberate isolation design beyond this scope.
+
+A local development executor is for trusted code and lifecycle development
+only. It is not a sandbox, a production backend, or evidence that Kubernetes
+security and resource controls work. Its documentation must identify unsupported
+controls, and it must not claim enforcement it cannot provide. Kubernetes
+integration tests use Kind and the production provider. Hardened isolation may
+be added only through an explicit design and scope decision.
+
+The Kubernetes controls below remain deployment requirements. Resource limits,
+timeouts, path validation, and static scanning do not establish a hostile-code
+security boundary.
 
 ## Actors
 
@@ -64,13 +83,14 @@ durations unless an operator configures an allowed override.
 | Pending task | An accepted task waits for capacity under the active task limit before allocation begins. |
 | Active task | A task holds capacity for allocation, workspace preparation, user-code execution, or result publication. A terminal outcome alone does not prove that the execution environment has stopped. |
 | Execution authorization | The control plane records irreversible permission to start user code before any external action can start it, as required by ADR 0001. |
-| Runtime completion | The runtime completes when it publishes the final result manifest after the uploads referenced in that manifest. User-process exit alone does not complete the runtime. |
+| Runtime completion | The runtime publishes the final result manifest after its referenced uploads and obtains a timely PostgreSQL completion receipt under ADR 0002. User-process exit or manifest publication alone is insufficient. |
 | Terminal outcome | The control plane records an immutable execution result. Cleanup and retention progress are tracked separately and cannot revise that result. |
 | Payloads | KubeTask owns the task specification, source, staged inputs, logs, result manifests, and artifacts. Cleanup does not delete caller-owned input objects. |
 
 The terms define behavior without specifying the complete set of task states.
 [ADR 0001](ADR/0001-authoritative-task-state.md) records the accepted persistence design.
-The follow-up designs listed below define exact transitions, protocol schemas, and recovery mechanisms.
+[ADR 0002](ADR/0002-task-lifecycle.md) defines transitions, event precedence, and lifecycle recovery.
+The follow-up designs listed below define protocol schemas and implementation details.
 
 ## Functional requirements
 
@@ -141,7 +161,7 @@ the acceptance response may create another task.
 | FR-036 | MUST | The service maps sandbox allocation, runtime, storage, and user-code failures to stable task-level error categories. |
 | FR-037 | MUST | A control-plane restart resumes reconciliation from durable state without creating a second execution attempt for a task whose execution has already been authorized. |
 | FR-038 | SHOULD | The runtime protocol permits runtime implementation or version changes without changing the public task API. |
-| FR-039 | MUST | User code receives at most one execution attempt per task. Allocation and preparation may be retried only before irreversible execution authorization and within existing phase deadlines. Authorization is persisted before any action can start user code. After authorization, no replacement environment or second user-code start is permitted, including when the first start outcome is unknown. |
+| FR-039 | MUST | User code receives at most one execution attempt per task. ADR 0002 requires one-use authorization bound to the execution identity before source retrieval or preparation. Lost authorization replies and runtime restarts never receive another permit. A lost allocation is not replaced. Safe retries obey phase deadlines and never repeat user-code execution. |
 
 ### Inputs and workspace
 
@@ -162,7 +182,7 @@ the acceptance response may create another task.
 
 | ID | Strength | Requirement |
 | --- | --- | --- |
-| FR-050 | MUST | The runtime publishes a versioned result manifest after uploading the logs and artifacts it references. A published manifest is immutable. Retries can confirm identical contents but cannot replace them. Success requires a validated manifest confirming a zero user-code exit code, completion of required transfers, and compliance with output limits. Workload exit alone cannot establish success. For cancellation, timeout, and infrastructure failure, the control plane may finalize without a manifest under the outcome rules below. |
+| FR-050 | MUST | The runtime publishes a versioned result manifest after uploading the logs and artifacts it references. A published manifest is immutable. Retries can confirm identical contents but cannot replace them. Success requires a timely PostgreSQL completion receipt under ADR 0002 and a validated manifest confirming a zero user-code exit code, completion of required transfers, and compliance with output limits. Publication or workload exit alone cannot establish success. For cancellation, timeout, and infrastructure failure, the control plane may finalize without a manifest under the outcome rules below. |
 | FR-051 | MUST | The runtime recursively collects regular files from `/workspace/outputs`. It does not follow symlinks or collect files outside that directory. The API does not accept output glob patterns. |
 | FR-052 | MUST | The runtime enforces limits on per-file size, total bytes, and file count while collecting outputs. Exceeding a limit reports `output_limit_exceeded` as an execution failure, subject to FR-064. Bounded logs and artifacts already uploaded and validated remain available as partial results. |
 | FR-053 | MUST | Artifacts are transferred directly to object storage. They are not carried through Kubernetes API responses or control-plane memory as a complete archive. |
@@ -181,7 +201,7 @@ the acceptance response may create another task.
 | FR-061 | MUST | Cancellation is idempotent and records durable intent before execution resources are changed. Repeating cancellation for a retained terminal task returns its existing outcome without changing it. A cancellation request does not guarantee that execution resources have already stopped. |
 | FR-062 | MUST | The reconciler stops user-code execution and releases execution resources for canceled tasks. Stop and cleanup failures remain visible and are retried under NFR-023 and NFR-024. Cancellation does not depend on the client connection remaining open. |
 | FR-063 | MUST | A task reaches the distinct `TimedOut` outcome if its execution budget expires before a qualifying completion, subject to the race rules in FR-064. The control plane can finalize the task without a runtime timeout manifest. |
-| FR-064 | MUST | The lifecycle ADR defines which event takes precedence when completion evidence, failure, durable cancellation intent, and phase deadlines conflict. It covers simultaneous events and delayed observations. The rules obey the outcome and deadline constraints below and never revise a committed terminal outcome. |
+| FR-064 | MUST | Task transitions follow ADR 0002's precedence for completion receipts, failure, cancellation intent, and phase deadlines, including simultaneous events and delayed observations. A committed terminal outcome never changes. |
 | FR-065 | SHOULD | Partial logs and artifacts that were safely published and validated before cancellation or timeout remain discoverable while retained and are identified as partial. Unvalidated or unpublished files are not promised as results. |
 | FR-066 | MUST | A task reaches the `Expired` terminal outcome if it reaches its pending deadline before dispatch, subject to FR-064. The `Expired` outcome applies to queue expiration. Payload or metadata retention expiration does not change the execution outcome. |
 | FR-067 | MUST | A task that reaches its allocation deadline before the runtime is ready for preparation ends as an infrastructure failure, subject to FR-064. Allocation retries do not reset this deadline. |
@@ -191,22 +211,26 @@ the acceptance response may create another task.
 The outcome and deadline rules apply to FR-050 and FR-060 through FR-067.
 
 First, pending time starts at durable acceptance and ends when active capacity is reserved for dispatch.
-Second, allocation time starts at that reservation and ends at the handoff to runtime preparation.
-Third, the execution budget starts at the same handoff, before preparation for the task begins.
+Second, allocation time starts at that reservation and ends at execution authorization.
+Third, the execution budget starts at authorization, before source retrieval or preparation begins.
 No interval between phases is left without a deadline.
 
 The execution budget covers specification and source retrieval, workspace preparation,
-input retrieval, user-code execution, output collection, and final manifest publication.
+input retrieval, user-code execution, output collection, final manifest publication, and the completion receipt.
 Allocation is excluded. Retries never extend or restart the applicable deadline.
 
 All runtime execution and result uploads must fit within the execution budget.
 There is no extra upload allowance after its deadline.
-If required publication cannot finish in time, the task times out subject to FR-064.
+If publication and receipt acceptance cannot finish in time, the task times out subject to FR-064.
 Control-plane observation, validation, and cleanup can finish after the deadline.
 
-Success requires validated evidence that the runtime completed before the execution deadline.
-A late observation of a timely completion does not by itself cause a timeout.
-User-code exit before the deadline is insufficient if result publication did not also complete in time.
+Success requires a completion receipt accepted before cancellation and the execution deadline,
+followed by validation of its manifest and referenced objects. Identical receipt retries return
+the original receipt; conflicting contents cannot replace it. A timely receipt keeps its priority
+while validation runs, even after the deadline or a control-plane restart.
+Validation retries last 60 seconds from receipt acceptance, followed by one final bounded read.
+Invalid or unverifiable evidence produces infrastructure failure. Without a timely receipt,
+even a published result can time out during a control-plane outage.
 
 The runtime must attempt to publish bounded partial results during a controlled stop when time
 and storage access remain. Timeout, forced termination, or storage failure can prevent publication.
@@ -215,19 +239,20 @@ Cancellation or expiration while a task is pending does not require a runtime or
 The control plane can establish cancellation, timeout, queue expiration, or infrastructure failure
 from durable intent and validated observations without a manifest.
 A missing manifest alone does not prove cancellation or timeout.
-An unexplained runtime loss without a valid manifest is an infrastructure failure.
+An unexplained runtime loss without an eligible completion receipt is an infrastructure failure,
+subject to FR-064.
 
 Manifest errors remain visible as diagnostics but cannot replace an outcome already established
 by the lifecycle precedence rules. Result publication and diagnostics arriving after a terminal
 commit cannot revise the recorded outcome.
 
-Persisted timestamps and deadlines use PostgreSQL time as required by ADR 0001.
-The lifecycle and runtime designs must define how completion timing is validated without ordering
-events by unsynchronized client clocks.
+Persisted timestamps and deadlines use PostgreSQL time sampled after acquiring locks.
+Task versions order events with equal timestamps. Runtime enforcement uses elapsed time,
+including authorization latency and suspension, as defined by ADR 0002.
 
-The lifecycle ADR must resolve the remaining transitions and event precedence before implementation.
-It must also define when active capacity is released. An environment that may still execute
-code cannot permit unsafe replacement or admission beyond the active limit.
+Active capacity is released only after allocation requests are resolved, all allocated runtimes
+and their children are stopped, and the provider cannot recreate them. Terminal state or API-side
+resource deletion alone does not release capacity.
 
 ### Reconciliation and cleanup
 
@@ -259,7 +284,9 @@ Expired metadata is unavailable even if database deletion is pending.
 Reusing an expired key can create a new task with a new internal ID.
 
 If cleanup remains incomplete, a tombstone accessible only to operators retains references
-to the remaining KubeTask-owned resources and the retry state. The tombstone does not retain
+to the remaining KubeTask-owned resources, any unreleased capacity reservation, and retry state.
+Reservation transfer is atomic under the admission lock. Active admission counts reservations
+in both task rows and tombstones. The tombstone does not retain
 the public task or key binding. Cleanup never deletes caller-owned inputs.
 Physical deletion can be retried and may finish after logical expiration.
 
@@ -293,7 +320,7 @@ capacity is available. It does not cancel accepted tasks or change their persist
 
 | ID | Strength | Requirement |
 | --- | --- | --- |
-| NFR-001 | MUST | The threat model assumes submitted code and input files are malicious. |
+| NFR-001 | MUST | The threat model states v0.1's controlled-deployment assumptions and excludes a hostile-code containment guarantee. The local development executor accepts trusted code only. Input validation, bounded processing, and documented deployment controls remain required. |
 | NFR-002 | MUST | Task workloads comply with the Kubernetes Restricted Pod Security Standard and run as non-root. They disallow privilege escalation, drop Linux capabilities, and do not use `hostPath`. They do not run as privileged containers. |
 | NFR-003 | MUST | Task workloads receive no Kubernetes service-account token unless a documented runtime integration requires one. |
 | NFR-004 | MUST | Each task receives only short-lived, task-scoped access to the object keys it must read or write. Long-lived infrastructure credentials are not exposed to user code. |
@@ -303,7 +330,7 @@ capacity is available. It does not cancel accepted tasks or change their persist
 | NFR-008 | MUST | Service and infrastructure credentials are redacted from API errors, logs, metrics, workload metadata, and persisted task status. |
 | NFR-009 | MUST | Kubernetes RBAC and object-store permissions follow least privilege. |
 | NFR-010 | MUST | Static source scanning, if provided, is treated only as defense in depth and not as the isolation boundary. |
-| NFR-011 | SHOULD | The runtime supports a configurable Kubernetes `RuntimeClass` for stronger isolation such as gVisor or Kata Containers. |
+| NFR-011 | MAY | A separate accepted design may add hardened runtime isolation, such as gVisor or Kata Containers. It is not required for v0.1 and must not be implied by use of Agent Sandbox or ordinary containers. |
 | NFR-012 | MUST | KubeTask v0.1 serves a single tenant. Platform network controls restrict HTTP and MCP access to trusted internal callers. Application authentication and per-user task authorization are outside the v0.1 deployment scope. Execution-resource ownership checks remain required. Public or multi-user deployment requires a separate authentication and authorization design. The service must determine tenant and principal identifiers without treating client metadata as identity. |
 | NFR-013 | MUST | Source, inputs, stdout, stderr, and artifact contents are not written to operational logs by default. |
 | NFR-014 | MUST | Each task workload has an enforced process-count limit. |
@@ -461,12 +488,9 @@ A returned user-code failure is a successful API operation.
 
 ## Required follow-up designs
 
-ADR 0001 is accepted. Implementation of the corresponding behavior requires
-reviewed and accepted designs for the following areas:
+ADRs 0001 and 0002 are accepted. Implementation still requires reviewed and
+accepted designs for:
 
-- Task lifecycle: complete transition table, phase boundaries, race precedence,
-  execution authorization, completion evidence, active-capacity release, and
-  recovery after uncertain external operations
 - Versioned task specification and result manifest: field types, bounds,
   canonicalization, reserved paths, integrity validation, and partial results
 - Runtime and Agent Sandbox contract: allocation, preparation, start gating,
@@ -478,6 +502,6 @@ reviewed and accepted designs for the following areas:
 - Official runtime image: package versions, build and update policy, and package
   inventory or software bill of materials
 
-The designs must preserve the requirements and the accepted ADR. Any proposed
+The designs must preserve the requirements and accepted ADRs. Any proposed
 change to observable behavior or v0.1 scope must be identified for review before
 implementation.

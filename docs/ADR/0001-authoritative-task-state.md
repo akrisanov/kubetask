@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-08-08
+- Amended by: [ADR 0002](0002-task-lifecycle.md), 2026-09-20
 
 ## Context
 
@@ -62,8 +63,8 @@ worker pool with per-task deduplication. It does not use `LISTEN/NOTIFY`,
 
 The task record includes the current state and version, requested and effective
 deadlines, cancellation intent, object references, an opaque execution
-reference, terminal outcome, reconciliation timing, retention timestamps, and
-cleanup state. Provider-specific Kubernetes identity is stored outside the
+reference, completion receipt, terminal outcome, reconciliation timing,
+retention timestamps, and cleanup state. Provider-specific Kubernetes identity is stored outside the
 domain model and includes the API resource, namespace, deterministic name, UID,
 and ownership markers.
 
@@ -117,10 +118,11 @@ after commit is ambiguous and a retry may create another task.
 
 ## Admission
 
-Admission uses one deployment-scoped database row as a transaction lock. While
-holding it, KubeTask derives pending and active counts from indexed task rows.
-Transactions that add pending work or move tasks between pending and active
-classes use the same lock.
+Admission uses one deployment-scoped database row as a transaction lock.
+Pending counts come from indexed task rows. Active counts include unreleased
+reservations in task rows and cleanup tombstones, as defined by ADR 0002.
+Transactions that change admission counts or transfer a reservation to a
+tombstone use the same lock.
 
 The pending limit is enforced during submission, and the active limit is
 enforced during dispatch. External storage and Kubernetes operations never run
@@ -140,15 +142,15 @@ before creation. After an ambiguous create, KubeTask reads that exact name and
 validates ownership. It records the Kubernetes UID and never silently adopts a
 same-named resource with a different UID or ownership marker.
 
-Retryable allocation and preparation cannot start user code. Before invoking a
-runtime start operation or releasing a start gate, KubeTask commits an
-irreversible execution authorization with the exact resource UID. If resource
-creation itself can start code, this marker is committed before creation.
+Allocation creates a runtime that cannot yet execute code. ADR 0002 requires
+one-use execution authorization, bound to the exact resource UID and runtime
+boot identity, before source retrieval or preparation begins. The authorization
+commits before the runtime receives its start permit.
 
 After authorization, KubeTask never creates a replacement environment or starts
 user code again for that task. An ambiguous outcome becomes an infrastructure
-failure. The lifecycle and runtime protocol will define the start-gate
-handshake without weakening this rule.
+failure. Lost authorization replies and runtime restarts never receive another
+permit. ADR 0002 also prohibits replacing a lost allocation before authorization.
 
 ## Object storage and results
 
@@ -165,10 +167,11 @@ deletion of KubeTask-owned keys. The operator configures cleanup for abandoned
 multipart uploads. Presigned URLs are generated on demand and never persisted.
 
 The runtime uploads logs and artifacts before publishing the versioned result
-manifest as the final commit marker. An existing byte-identical manifest may be
-confirmed but never replaced with different content. The reconciler validates
-the manifest and commits its reference and terminal outcome in one PostgreSQL
-transaction. Workload completion alone never implies success.
+manifest as the payload commit marker. An existing byte-identical manifest may
+be confirmed but never replaced with different content. ADR 0002 additionally
+requires a completion receipt in PostgreSQL before cancellation and the execution
+deadline. The reconciler validates that receipt's manifest and commits the
+terminal outcome. Publication or workload completion alone never implies success.
 
 PostgreSQL and object storage have no cross-store transaction. Correctness
 depends on immutable objects, idempotent publication, authoritative database
@@ -184,8 +187,10 @@ KubeTask-owned keys and never deletes caller-owned input objects.
 Task metadata and its idempotency binding are deleted at the metadata-retention
 deadline. If payload or execution-resource cleanup remains incomplete, the same
 transaction creates an operator-only cleanup tombstone containing only the
-remaining references, retry state, and bounded failure data. Tombstones remain
-until cleanup succeeds and do not extend public task or idempotency retention.
+remaining references, any unreleased capacity reservation, retry state, and
+bounded failure data. Reservation transfer holds the admission lock and preserves
+the active count. Tombstones remain until cleanup succeeds and do not extend
+public task or idempotency retention.
 
 Production PostgreSQL is supplied and operated by the deployment platform.
 KubeTask does not install a production database. Kind may include a disposable
@@ -199,9 +204,10 @@ at-most-once execution for task records lost beyond that recovery point.
 
 After a database restore, KubeTask audits owned object and Agent Sandbox
 resources before accepting work. Unreferenced resources are cleaned up. If a
-resource matches a restored task but its execution identity or authorization
-was lost, KubeTask finalizes a valid immutable result when available and
-otherwise records an infrastructure failure. It never restarts uncertain work.
+resource matches a restored task but its execution identity, authorization, or
+timely completion receipt was lost, a manifest alone cannot establish success.
+KubeTask finalizes only when retained evidence satisfies ADR 0002; otherwise it
+records an infrastructure failure. It never restarts uncertain work.
 
 Readiness requires PostgreSQL, a compatible schema, the singleton lock, safe
 object-storage capabilities, and completion of any post-restore audit. Liveness
@@ -253,12 +259,10 @@ In-memory state cannot survive restart. None is suitable as task authority.
 
 ## Required follow-up designs
 
-Implementation requires:
+ADR 0002 defines the task lifecycle. Implementation still requires:
 
-1. A task lifecycle specification covering transitions, race precedence,
-   retries, and execution authorization
-2. Versioned task-specification and result-manifest contracts, including
+1. Versioned task-specification and result-manifest contracts, including
    canonical request and object-store profiles
-3. A PostgreSQL schema and migration design
-4. A reconciliation and cleanup design
-5. A recovery runbook with concrete recovery objectives
+2. A PostgreSQL schema and migration design
+3. A reconciliation and cleanup design
+4. A recovery runbook with concrete recovery objectives
