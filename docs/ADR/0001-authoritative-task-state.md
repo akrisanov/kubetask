@@ -6,263 +6,219 @@
 
 ## Context
 
-KubeTask presents execution as a durable asynchronous task lifecycle. Accepted
-tasks must survive control-plane restarts, support idempotent submission and
-cancellation, remain safe under concurrent API and reconciliation activity,
-and retain results independently of execution workloads.
+Accepted tasks must survive control-plane restarts, support idempotent submission
+and cancellation, remain safe under concurrent updates, and retain results after
+workloads stop. Metadata needs transactions, uniqueness, indexed work discovery,
+and retention queries; payloads need separate storage and transfer.
 
-Task metadata requires transactions, uniqueness, concurrency control, indexed
-work discovery, and retention queries. Task source, inputs, logs, manifests,
-and artifacts have different size, access, and transfer requirements. Agent
-Sandbox owns sandbox resource lifecycle, while KubeTask owns task lifecycle.
-
-KubeTask v0.1 is single-tenant, with default limits of 100 pending and 20 active
-tasks. Multiple control-plane replicas are desirable but are not required for
-v0.1.
+v0.1 is single-tenant, with default limits of 100 pending and 20 active tasks.
+Multiple control-plane replicas are desirable but not required.
 
 ## Decision
 
-PostgreSQL is authoritative for:
+| System | Responsibility |
+| --- | --- |
+| PostgreSQL | Authoritative task metadata, lifecycle state, idempotency bindings, history, reconciliation scheduling, retries, and cleanup progress |
+| S3-compatible object storage | Authoritative specifications, source, inputs, stdout, stderr, manifests, and artifacts |
+| Kubernetes and Agent Sandbox | Observed execution state and sandbox resource lifecycle |
 
-- task metadata and current lifecycle state
-- idempotency bindings
-- transition history
-- reconciliation scheduling and retry state
-- cleanup progress
+KubeTask owns task lifecycle. PostgreSQL stores immutable object references and
+validation metadata, never payload contents. Deleting or replacing execution
+resources cannot erase accepted tasks or revise terminal results.
 
-S3-compatible object storage is authoritative for task specifications, source,
-inputs, captured stdout and stderr, result manifests, and artifacts. PostgreSQL
-stores immutable object references and validation metadata, not payload
-contents.
-
-Kubernetes and Agent Sandbox resources are observed execution state, not task
-records. Their deletion or replacement cannot erase an accepted task or revise
-its terminal result.
-
-KubeTask will not use a Task custom resource, SQLite, object storage, or memory
-as an alternative authority. v0.1 will not add a message broker, event-sourced
-task model, or transactional outbox.
+Task custom resources, SQLite, object storage, and memory are not alternative
+task authorities. v0.1 adds no broker, event-sourced task model, or transactional
+outbox.
 
 ## v0.1 coordination model
 
-v0.1 runs one control-plane replica and one active reconciler. This
-intentionally defers NFR-026 to avoid distributed task claims before capacity
-testing demonstrates a need.
+One control-plane replica runs one active reconciler. This defers NFR-026 and
+distributed task claims until capacity testing demonstrates a need.
 
 The process holds a deployment-scoped PostgreSQL advisory lock on a dedicated
-connection while ready and reconciling. Loss of the lock stops reconciliation
-and removes readiness. The Deployment uses the `Recreate` strategy so a rollout
-terminates the lock holder before its replacement must become ready. This
-causes brief API downtime but does not terminate Agent Sandbox workloads.
+connection while ready and reconciling. Detecting lock loss removes readiness
+and stops new mutations and dispatch. The lock does not fence transactions on
+other connections or external calls already in flight. The Deployment uses
+`Recreate` to terminate the previous process before its replacement becomes ready,
+briefly interrupting the API but leaving Agent Sandbox workloads running.
 
-The reconciler uses indexed scans of due incomplete tasks and a bounded local
-worker pool with per-task deduplication. It does not use `LISTEN/NOTIFY`,
-`FOR UPDATE SKIP LOCKED`, or per-task database leases in v0.1.
+Reconciliation uses indexed scans of due incomplete tasks and a bounded worker
+pool with per-task deduplication. v0.1 uses no `LISTEN/NOTIFY`,
+`FOR UPDATE SKIP LOCKED`, or per-task database leases.
 
 ## Persistence guarantees
 
-The task record includes the current state and version, requested and effective
-deadlines, cancellation intent, object references, an opaque execution
-reference, completion receipt, terminal outcome, reconciliation timing,
-retention timestamps, and cleanup state. Provider-specific Kubernetes identity is stored outside the
-domain model and includes the API resource, namespace, deterministic name, UID,
-and ownership markers.
+Task records retain state and version, requested timeout and effective deadlines,
+cancellation intent, object references, opaque execution identity, completion
+receipt, terminal outcome, reconciliation timing, retention, and cleanup state.
+Provider identity stays outside the domain model: API resource, namespace,
+deterministic name, UID, and ownership markers.
 
-PostgreSQL time is authoritative for acceptance, state timestamps, deadlines,
-retry schedules, and retention. Persisted errors use bounded stable codes and
-redacted diagnostic text. Source, output, credentials, stack traces, raw SDK
-responses, and Kubernetes objects are not stored as diagnostic fields.
+PostgreSQL time governs acceptance, state timestamps, deadlines, retries, and
+retention. Persisted errors contain bounded stable codes and redacted diagnostics,
+never source, output, credentials, stack traces, raw SDK responses, or Kubernetes
+objects.
 
-Every task mutation runs in a transaction and includes the expected state and
-version. Stale or invalid updates change no rows. Successful state transitions
-append a compact history entry in the same transaction. Transition rules live
-in the shared task domain package rather than SQL triggers.
-
-Terminal execution outcomes are immutable. Cleanup has separate state and
-versioning so cleanup failure cannot replace or move an execution outcome
-backward.
+Lifecycle mutations check expected state and task version transactionally;
+stale or invalid writes change no rows. Transitions append compact history
+atomically. Rules live in the shared task domain package, not SQL triggers.
+Terminal outcomes are immutable. Cleanup uses its own version and, on task rows,
+expected state, as defined in ADR 0003. Documented no-ops return current retained
+facts without advancing versions or history.
 
 ## Submission and idempotency
 
-An idempotency key is optional and deployment-scoped in single-tenant v0.1.
-KubeTask stores its SHA-256 digest, not the raw value. The request digest is
-calculated from a versioned canonical client request before operator defaults
-are applied. Canonicalization preserves missing values versus explicit zeros
-and ignores transport encoding and map ordering.
+Idempotency keys are optional and deployment-scoped. Store their SHA-256 digest,
+never the raw key. Hash a versioned canonical client request before applying
+operator defaults, preserving missing values versus explicit zeros and ignoring
+transport encoding and map order.
 
-KubeTask resolves an existing idempotency binding before current admission or
-external input checks. The same key and request digest return the existing task.
-The same key with a different digest returns a deterministic conflict. The
-binding expires with task metadata, after which the key may be reused.
+Resolve retained bindings before current policy, admission, or external input
+checks. Compare retries using the binding's canonicalization version: the same
+key and request digest return the existing task; a different digest returns a
+deterministic conflict. Upgrades must support retained canonicalization versions
+until their bindings expire. Bindings expire with task metadata, permitting key
+reuse; retries do not extend retention.
 
-Validation, policy, unsupported-behavior, and saturation failures are
-synchronous pre-task errors. They create no task, idempotency binding, or
-execution resource. Only an admitted request receives a task ID. Reusing a key
-after rejection re-evaluates the request.
+Validation, policy, unsupported-behavior, and saturation failures are synchronous
+pre-task errors: no task, binding, or execution resource is created. Only admitted
+requests receive task IDs. Retrying a rejected key re-evaluates the request.
 
-PostgreSQL and object storage cannot commit atomically. Durable acceptance uses
-this order:
+PostgreSQL and object storage cannot commit atomically. Accept in this order:
 
-1. Parse and bound the request, then resolve existing idempotency
-2. Validate the complete request and input objects
-3. Generate the internal task ID and effective specification
-4. Upload source and specification to unique immutable object keys
+1. Parse and bound the request, then resolve existing idempotency.
+2. Validate the complete request and input objects.
+3. Generate the internal task ID and effective specification.
+4. Upload source and specification to unique immutable object keys.
 5. In one database transaction, resolve a concurrent idempotency winner,
-   enforce admission, and insert the task, binding, and first transition
-6. Commit before returning the task ID
+   enforce admission, and insert the task, optional binding, and first transition.
+6. Commit before returning the task ID.
 
-The database commit is the acceptance point. Failed admission, a failed
-transaction, or a lost idempotency race may leave unreferenced objects. Cleanup
-removes them after a safety interval. Without an idempotency key, a lost response
-after commit is ambiguous and a retry may create another task.
+The commit is the acceptance point. Failed admission, transactions, or idempotency
+races can leave unreferenced objects; cleanup removes them after a safety interval.
+Without a key, retrying a lost acceptance response may create another task.
 
 ## Admission
 
-Admission uses one deployment-scoped database row as a transaction lock.
-Pending counts come from indexed task rows. Active counts include unreleased
-reservations in task rows and cleanup tombstones, as defined by ADR 0002.
-Transactions that change admission counts or transfer a reservation to a
-tombstone use the same lock.
-
-The pending limit is enforced during submission, and the active limit is
-enforced during dispatch. External storage and Kubernetes operations never run
-inside the admission transaction. v0.1 does not maintain separate counters or
-a counter-repair protocol.
+One deployment-scoped row locks all transactions that change admission counts
+or transfer reservations to tombstones. Enforce the pending limit at submission
+using indexed task rows, and the active limit at dispatch using unreleased
+reservations in tasks and tombstones under ADR 0002. External storage and
+Kubernetes calls stay outside admission transactions. v0.1 maintains no separate
+counters or counter-repair protocol.
 
 ## Reconciliation and execution safety
 
-The reconciler never holds a database transaction while calling Kubernetes,
-Agent Sandbox, or object storage. It performs one bounded external step and
-persists the observation with optimistic concurrency. Retry timing and bounded
-exponential backoff with jitter are durable. Permanent failures and exhausted
-retries become task failures or operator-visible cleanup failures.
+The reconciler performs one bounded external step outside database transactions,
+then persists the observation with optimistic concurrency. Retry timing and
+bounded exponential backoff with jitter are durable. Permanent failures and
+exhausted retries become task failures or operator-visible cleanup failures.
 
-The Agent Sandbox claim name is derived from the internal task ID and recorded
-before creation. After an ambiguous create, KubeTask reads that exact name and
-validates ownership. It records the Kubernetes UID and never silently adopts a
-same-named resource with a different UID or ownership marker.
+Derive the Agent Sandbox claim name from the internal task ID and persist it
+before creation. Resolve ambiguous creates by reading that name and verifying
+ownership. Record its UID; never adopt a resource with a different UID or
+ownership marker.
 
-Allocation creates a runtime that cannot yet execute code. ADR 0002 requires
-one-use execution authorization, bound to the exact resource UID and runtime
-boot identity, before source retrieval or preparation begins. The authorization
-commits before the runtime receives its start permit.
-
-After authorization, KubeTask never creates a replacement environment or starts
-user code again for that task. An ambiguous outcome becomes an infrastructure
-failure. Lost authorization replies and runtime restarts never receive another
-permit. ADR 0002 also prohibits replacing a lost allocation before authorization.
+Allocated runtimes cannot execute code until authorization has an acknowledged
+commit and a one-use start permit is returned, bound to the exact resource UID
+and runtime boot identity. Authorization precedes source retrieval and preparation.
+Under ADR 0002, lost allocations are never replaced, and lost authorization
+replies and runtime restarts receive no new permit. Established execution
+uncertainty is an infrastructure failure subject to ADR 0002's event precedence.
+User code is never started again for the same task.
 
 ## Object storage and results
 
-KubeTask-owned object references include the storage location, key, byte size,
-SHA-256 checksum, and version or ETag when available. Accepted inputs require a
-stable version ID or an ETag enforceable through a conditional read. The runtime
-uses a version-addressed or conditional GET and fails rather than consume a
-changed input.
+Owned object references contain location, key, byte size, SHA-256 checksum, and
+version or ETag when available. Accepted inputs require a stable version ID or
+an ETag enforceable through conditional GET. The runtime uses version-addressed
+or conditional reads and fails rather than consume changed inputs.
 
-The supported S3-compatible profile must provide atomic completed writes,
-read-after-write behavior, conditional or versioned creation, conditional or
-versioned reads, streaming or multipart transfer, and paginated listing and
-deletion of KubeTask-owned keys. The operator configures cleanup for abandoned
-multipart uploads. Presigned URLs are generated on demand and never persisted.
+S3-compatible storage must support atomic completed writes, read-after-write
+behavior, conditional or versioned creation and reads, streaming or multipart
+transfer, and paginated listing and deletion of owned keys. Operators configure
+abandoned multipart-upload cleanup. Presigned URLs are generated on demand,
+never persisted.
 
-The runtime uploads logs and artifacts before publishing the versioned result
-manifest as the payload commit marker. An existing byte-identical manifest may
-be confirmed but never replaced with different content. ADR 0002 additionally
-requires a completion receipt in PostgreSQL before cancellation and the execution
-deadline. The reconciler validates that receipt's manifest and commits the
-terminal outcome. Publication or workload completion alone never implies success.
+The runtime uploads logs and artifacts, then publishes the versioned manifest
+as the payload commit marker. Retries can confirm identical bytes, never replace
+them. ADR 0002 also requires a PostgreSQL completion receipt before cancellation
+and the execution deadline. The reconciler validates its manifest and commits
+the outcome; publication or workload completion alone cannot establish success.
 
-PostgreSQL and object storage have no cross-store transaction. Correctness
-depends on immutable objects, idempotent publication, authoritative database
-references, and reconciliation of missing or unreferenced objects.
+Cross-store consistency depends on immutable objects, idempotent publication,
+authoritative database references, and reconciliation of missing or unreferenced
+objects.
 
 ## Retention and recovery
 
-Payload cleanup first marks references expired in PostgreSQL, then deletes the
-objects, then records completion. APIs stop returning references and issuing
-presigned URLs after the first committed step. Cleanup deletes only
-KubeTask-owned keys and never deletes caller-owned input objects.
+Terminal writes record payload and metadata deadlines from current retention
+policy; payload retention cannot exceed metadata retention. Later policy changes
+do not revise those deadlines. At payload expiration, APIs omit references and
+previews and stop issuing URLs, even if cleanup is delayed. Previously issued
+URLs expire no later than that deadline.
 
-Task metadata and its idempotency binding are deleted at the metadata-retention
-deadline. If payload or execution-resource cleanup remains incomplete, the same
-transaction creates an operator-only cleanup tombstone containing only the
-remaining references, any unreleased capacity reservation, retry state, and
-bounded failure data. Reservation transfer holds the admission lock and preserves
-the active count. Tombstones remain until cleanup succeeds and do not extend
-public task or idempotency retention.
+Cleanup records payload expiration before deletion, waits for ADR 0002's stop
+conditions, deletes owned objects, then records completion. Account for delayed
+uploads; never delete caller-owned inputs.
 
-Production PostgreSQL is supplied and operated by the deployment platform.
-KubeTask does not install a production database. Kind may include a disposable
-instance, and integration tests use PostgreSQL rather than SQLite. Database
-changes use versioned migrations and a stop, migrate, start sequence in v0.1.
+Metadata expiration ends public lookup and idempotency even if deletion is
+delayed. Delete the task and binding in one transaction that also creates an
+operator-only tombstone if payload or execution cleanup is incomplete. Retain
+remaining references, provider identity, unresolved allocation intent, stop
+evidence, reservations, cleanup version, retry state, and bounded failures.
+Hold the admission lock during transfer, preserving the active count. Tombstones
+remain until cleanup succeeds without extending public retention.
 
-Normal process or Pod restart loses no committed task state. Production
-deployments must define and restore-test PostgreSQL recovery point and recovery
-time objectives. KubeTask does not claim zero data loss, idempotency, or
-at-most-once execution for task records lost beyond that recovery point.
+The deployment platform supplies and operates production PostgreSQL. Kind may
+include a disposable instance; integration tests use PostgreSQL, never SQLite.
+v0.1 uses versioned migrations in a stop, migrate, start sequence.
 
-After a database restore, KubeTask audits owned object and Agent Sandbox
-resources before accepting work. Unreferenced resources are cleaned up. If a
-resource matches a restored task but its execution identity, authorization, or
-timely completion receipt was lost, a manifest alone cannot establish success.
-KubeTask finalizes only when retained evidence satisfies ADR 0002; otherwise it
-records an infrastructure failure. It never restarts uncertain work.
+Process or Pod restart preserves committed state. Production deployments must
+define and restore-test recovery point and recovery time objectives. Records lost
+beyond the recovery point have no zero-data-loss, idempotency, or at-most-once
+execution guarantee.
+
+After restore, audit owned objects and Agent Sandbox resources before accepting
+work; resolve unreferenced resources conservatively. Preserve retained terminal
+outcomes. If the audit establishes lost execution identity, authorization, or
+timely receipt evidence for a nonterminal task, apply ADR 0002's event precedence;
+record infrastructure failure when no higher-priority outcome applies. A manifest
+alone cannot establish success. Never restart uncertain work.
 
 Readiness requires PostgreSQL, a compatible schema, the singleton lock, safe
-object-storage capabilities, and completion of any post-restore audit. Liveness
-does not depend on downstream availability or individual task success.
+object-storage capabilities, and completion of any required post-restore audit.
+Liveness is independent of downstream availability and task success.
 
 ## Alternatives considered
 
-### KubeTask Task custom resource
-
-A custom resource would provide Kubernetes persistence, watches, and
-`resourceVersion` concurrency. It was rejected because KubeTask exposes an
-imperative task API, requires atomic idempotency and admission across records,
-and retains application state independently of cluster workloads. It would also
-couple task recovery and retention to Kubernetes API and etcd operations.
-
-### SQLite on a persistent volume
-
-SQLite could support a single-replica v0.1. It was rejected because recovery
-would depend on volume attachment and filesystem semantics, and later
-multi-replica support would require another persistence implementation.
-
-### Object storage or infrastructure state
-
-Object storage lacks the required transactions, uniqueness, and indexed work
-discovery. SandboxClaim, Sandbox, and Pod status do not represent durable
-acceptance, idempotency, cancellation intent, result retention, or cleanup.
-In-memory state cannot survive restart. None is suitable as task authority.
+| Alternative | Reason rejected |
+| --- | --- |
+| Task custom resource | Provides persistence, watches, and `resourceVersion`, but does not fit atomic idempotency and admission across records behind an imperative task API. Couples recovery and retention to Kubernetes and etcd |
+| SQLite on a persistent volume | Supports one replica, but ties recovery to volume and filesystem behavior and requires another persistence implementation for multiple replicas |
+| Object storage | Lacks required transactions, uniqueness, and indexed work discovery |
+| SandboxClaim, Sandbox, or Pod state | Does not represent durable acceptance, idempotency, cancellation, result retention, or cleanup |
+| Memory | Cannot survive process restart |
 
 ## Consequences
 
-### Positive
+Acceptance, idempotency, transitions, admission, and history share transactional
+invariants. State and results outlive processes; payloads stay outside PostgreSQL
+and etcd. Agent Sandbox remains an execution provider, and v0.1 needs neither
+distributed task claims nor a separate queue.
 
-- Task acceptance, idempotency, transitions, admission, and history share
-  transactional invariants
-- Task state and results outlive control-plane and workload processes
-- Payloads remain outside PostgreSQL and Kubernetes etcd
-- Agent Sandbox remains an execution provider rather than a second task
-  authority
-- v0.1 avoids distributed task claims and a separate queueing system
-
-### Negative
-
-- PostgreSQL is a required production and readiness dependency
-- Operators must provide database security, backup, restore, monitoring, and
-  capacity management
-- v0.1 has brief API downtime during rollout or replica failure
-- Cross-store and external API failures require explicit reconciliation
-- Multiple active control-plane replicas require a later design
+PostgreSQL becomes a production and readiness dependency. Operators own database
+security, backup, restore, monitoring, and capacity. Rollouts and replica failure
+briefly interrupt the API. Cross-store and external failures require reconciliation;
+multiple active replicas require a later design.
 
 ## Required follow-up designs
 
-ADR 0002 defines the task lifecycle. Implementation still requires:
+[ADR 0002](0002-task-lifecycle.md) defines lifecycle;
+[ADR 0003](0003-task-store.md) defines storage records, transactions, and migrations.
+Remaining designs cover:
 
 1. Versioned task-specification and result-manifest contracts, including
    canonical request and object-store profiles
-2. A PostgreSQL schema and migration design
-3. A reconciliation and cleanup design
-4. A recovery runbook with concrete recovery objectives
+2. Reconciliation and cleanup
+3. A recovery runbook with concrete recovery objectives

@@ -24,7 +24,7 @@ stateDiagram-v2
     [*] --> Pending: Durable acceptance
     Pending --> Allocating: Reserve capacity
     Allocating --> Running: Authorize exact runtime
-    Running --> Succeeded: Validated completion
+    Running --> Succeeded: Validated successful completion
 
     Pending --> Expired: Pending deadline
     Pending --> Cancelled: Cancellation
@@ -57,35 +57,43 @@ different UID or replace a lost allocation.
 Before fetching source or preparing inputs, the runtime requests authorization.
 One transaction changes `Allocating` to `Running`, binds the resource UID and
 runtime boot identity, and sets the execution deadline. Only that request gets
-a one-use start permit after commit. Lost replies and runtime or Pod restarts
-never receive another permit. Established start uncertainty becomes an
-infrastructure failure.
+a one-use start permit after an acknowledged commit. An uncertain commit sends
+no permit; later reads cannot recreate one. Lost replies and runtime or Pod
+restarts never receive another permit. Established start uncertainty becomes an
+infrastructure failure subject to the event precedence below.
 
 Phase budgets start at acceptance (`Pending`), capacity reservation (`Allocating`),
 and authorization (`Running`). Execution includes preparation, uploads, and the
 completion receipt. Retries never reset deadlines.
 
 The runtime independently enforces its budget using elapsed time from before its
-authorization request, including latency and suspension. It drains bounded logs and stops the
-process tree, including children surviving parent exit. An early deadline stop
-waits for the database deadline to establish `TimedOut`. Client disconnects do
-not cancel tasks.
+authorization request, including latency and suspension. It drains bounded logs
+and stops the process tree, including children surviving parent exit. An early
+deadline stop waits for the database deadline to establish `TimedOut`, subject
+to event precedence. Client disconnects do not cancel tasks.
 
 ### Completion and cancellation
 
 After uploading logs and artifacts, the runtime publishes an immutable manifest
 and submits its reference and digest as a PostgreSQL **completion receipt**.
-Acceptance requires the authorized runtime, no cancellation, and an unexpired
-execution deadline. Identical retries return the original receipt; conflicts
-cannot replace it. Cancel and timeout reports are partial results, not eligible
-receipts.
+New receipt acceptance requires `Running`, the authorized resource and boot
+identity, no cancellation, and an unexpired execution deadline. While task
+metadata is retained, identical retries return the original receipt even after
+cancellation, deadline, or completion; conflicts cannot replace it. Cancel and
+timeout reports are partial results, not eligible receipts.
 
-The reconciler validates the manifest and referenced objects before recording
-an outcome; a zero exit alone is insufficient. Validation retries last 60 seconds
-from receipt acceptance, followed by one final bounded read. Restart cannot reset
-this window. Invalid or unverifiable evidence produces infrastructure failure. After
-a lost S3 write response, verify the stored digest; a conditional-write conflict
-does not prove identical contents.
+The reconciler resolves an eligible receipt by validating its manifest and
+referenced objects. Success requires a zero user-code exit, completed required
+transfers, and compliance with output limits. Valid evidence of a nonzero exit
+or an output-limit violation produces execution failure. Invalid or unverifiable
+evidence produces infrastructure failure. Validation retries last 60 seconds
+from receipt acceptance, followed by one final bounded read; restart cannot reset
+this window. After a lost S3 write response, verify the stored digest; a
+conditional-write conflict does not prove identical contents.
+
+Without an eligible receipt, cancellation, expiration, timeout, and established
+infrastructure failure can be finalized from durable intent and validated
+observations without a manifest, following this precedence.
 
 Cancellation records its first intent durably and returns the current task.
 Repeated requests change neither intent nor outcome. Apply events in this order:
@@ -96,8 +104,10 @@ Repeated requests change neither intent nor outcome. Apply events in this order:
 4. Apply the phase deadline: `Expired`, allocation failure, or `TimedOut`.
 5. Apply an established failure; otherwise continue.
 
-At the deadline, the deadline wins. An eligible receipt keeps priority during
-validation. Cancellation requests a stop; it neither proves termination nor
+A new receipt or cancellation recorded at the deadline cannot preempt it.
+Earlier eligible receipts and timely cancellation retain their priority after
+the deadline. Versions order receipt and cancellation events with equal
+timestamps. Cancellation requests a stop; it neither proves termination nor
 undoes effects. Late validated partial results may be exposed while retained
 without changing outcome or retention.
 
@@ -109,17 +119,18 @@ cannot recreate them. Terminal outcomes, missing Pods, and successful delete
 requests are insufficient. Uncertain reservations remain visible for operator
 resolution and never expire automatically.
 
-At metadata expiration, atomically transfer unreleased capacity to the cleanup
-tombstone. Admission counts task and tombstone reservations. Object cleanup can
-proceed separately after execution stops, accounting for delayed uploads before
-declaring completion.
+At metadata expiration, atomically transfer unfinished cleanup, including any
+unreleased capacity, to a tombstone. Admission counts task and tombstone
+reservations. Payload deletion waits for logical expiration and the stop
+conditions above, accounting for delayed uploads before declaring completion.
 
 Restart resumes observation and cleanup from durable state, never a start
-permit. Lock loss stops new mutations and dispatch without canceling in-flight
-external requests. Shutdown must not invoke SDK cleanup that deletes running
-task resources. Local recovery verifies process identity beyond a PID. Database
-restore requires ADR 0001's audit: never rerun uncertain work or infer timely
-completion from a manifest alone.
+permit. Detected lock loss stops new mutations and dispatch and removes readiness;
+it does not fence transactions on other connections or in-flight external calls.
+Shutdown must not invoke SDK cleanup that deletes running task resources. Local
+recovery verifies process identity beyond a PID. Database restore requires
+ADR 0001's audit: preserve terminal outcomes, follow event precedence, and never
+rerun uncertain work or infer timely completion from a manifest alone.
 
 ## Tradeoffs and amendments
 
@@ -135,12 +146,14 @@ This ADR amends the requirements and ADR 0001 in two areas:
 - **Retention accounting:** capacity held in cleanup tombstones remains counted
   after task metadata expires, replacing task-row-only admission counts.
 
-Preparation and finalization need no separate states. Runtime schemas,
-authentication, and SQL layout belong in separate designs.
+Preparation and finalization need no separate states. Runtime schemas and
+authentication require separate designs; [ADR 0003](0003-task-store.md) defines
+the storage layout and transactions.
 
 ## Essential acceptance cases
 
-- Lost acceptance reply and duplicate submission return the same retained task.
+- Retrying a lost acceptance reply with the same retained idempotency key and
+  request returns the same task; without a key, a retry may create another task.
 - Concurrent admission and dispatch cannot exceed their respective limits.
 - Lost create or start replies, restarted runtimes, and reused resource names
   cannot cause a second attempt or premature capacity release.
